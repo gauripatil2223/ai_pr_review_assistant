@@ -1,9 +1,9 @@
-"""Ollama integration for diff analysis."""
+"""LLM integration supporting multiple providers (Ollama, Together AI)."""
 
 from __future__ import annotations
 
 import json
-import re
+import os
 from typing import Any, Dict
 
 import requests
@@ -11,20 +11,15 @@ import requests
 from config import OLLAMA_BASE_URL, OLLAMA_MODEL
 
 
-def _extract_json(text: str) -> Dict[str, Any]:
-    """Extract JSON safely from model output."""
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return {}
-    try:
-        return json.loads(match.group())
-    except json.JSONDecodeError:
-        return {}
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
 
 
+# -----------------------------
+# COMMON HELPERS
+# -----------------------------
 def _normalize_result(data: Dict[str, Any]) -> Dict[str, list]:
     keys = ["bugs", "missing_tests", "bad_practices", "risks", "suggestions"]
-    normalized = {}
+    normalized: Dict[str, list] = {}
 
     for key in keys:
         value = data.get(key, [])
@@ -38,48 +33,120 @@ def _normalize_result(data: Dict[str, Any]) -> Dict[str, list]:
     return normalized
 
 
-def analyze_diff(diff_chunk: str) -> Dict[str, list]:
-    prompt = f"""
-You are a senior software engineer performing a strict PR review.
+def _build_prompt(diff_chunk: str) -> str:
+    return f"""
+You are a senior software engineer performing a rigorous PR review.
 
-Analyze the following git diff and provide structured output:
+Follow this process:
+1. Understand the change
+2. Identify edge cases and risks
+3. Suggest test coverage
 
-1. Bugs / Logical Issues
-2. Missing Test Cases
-3. Bad Practices / Code Smells
-4. Risk Analysis
-5. Suggestions
+Rules:
+- Assume inputs are unsafe
+- Always suggest tests if logic exists
+- Avoid generic advice
 
-Be specific. Avoid generic advice.
+Return STRICT JSON:
+
+{{
+  "bugs": [],
+  "missing_tests": [],
+  "bad_practices": [],
+  "risks": [],
+  "suggestions": []
+}}
 
 Git Diff:
 {diff_chunk}
-
-Return ONLY valid JSON.
 """
+
+
+# -----------------------------
+# OLLAMA IMPLEMENTATION
+# -----------------------------
+def analyze_ollama(diff_chunk: str) -> Dict[str, list]:
+    prompt = _build_prompt(diff_chunk)
 
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
+        "format": "json",
         "options": {"temperature": 0},
     }
 
-    for _ in range(2):  # retry
-        try:
-            response = requests.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json=payload,
-                timeout=120,
-            )
+    response = requests.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json=payload,
+        timeout=120,
+    )
 
-            content = response.json().get("response", "")
-            parsed = _extract_json(content)
+    if response.status_code >= 300:
+        raise RuntimeError(f"Ollama error: {response.text}")
 
-            if parsed:
-                return _normalize_result(parsed)
+    content = response.json().get("response", "")
 
-        except Exception:
-            continue
+    if not content.strip():
+        return _normalize_result({})
 
-    return {k: [] for k in ["bugs", "missing_tests", "bad_practices", "risks", "suggestions"]}
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return _normalize_result({})
+
+    return _normalize_result(parsed)
+
+
+# -----------------------------
+# TOGETHER AI IMPLEMENTATION
+# -----------------------------
+def analyze_together(diff_chunk: str) -> Dict[str, list]:
+    api_key = os.getenv("TOGETHER_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing TOGETHER_API_KEY")
+
+    prompt = _build_prompt(diff_chunk)
+
+    response = requests.post(
+        "https://api.together.xyz/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "Qwen/Qwen2-7B-Instruct",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+        },
+        timeout=60,
+    )
+
+    if response.status_code >= 300:
+        raise RuntimeError(f"Together AI error: {response.text}")
+
+    content = response.json()["choices"][0]["message"]["content"]
+
+    try:
+        start = content.index("{")
+        end = content.rindex("}") + 1
+        parsed = json.loads(content[start:end])
+    except Exception:
+        return _normalize_result({})
+
+    return _normalize_result(parsed)
+
+
+# -----------------------------
+# MAIN ENTRY (ROUTER)
+# -----------------------------
+def analyze_diff(diff_chunk: str) -> Dict[str, list]:
+    """Route to appropriate provider."""
+    if LLM_PROVIDER == "ollama":
+        return analyze_ollama(diff_chunk)
+
+    elif LLM_PROVIDER == "together":
+        return analyze_together(diff_chunk)
+
+    else:
+        raise ValueError(f"Unsupported LLM_PROVIDER: {LLM_PROVIDER}")

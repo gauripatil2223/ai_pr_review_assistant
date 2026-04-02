@@ -8,9 +8,14 @@ from typing import List
 from config import BASE_BRANCH, DIFF_CHUNK_SIZE
 from formatter import format_report
 from git_utils import GitDiffError, ensure_git_repo, fetch_diff
-from github import github_context_available, post_pr_comment
+from github import github_context_available, post_or_update_pr_comment
 from llm import analyze_diff
 from reviewer import chunk_diff, merge_review_results
+from config import validate_config
+from dotenv import load_dotenv
+load_dotenv()
+
+validate_config()
 
 
 def main() -> int:
@@ -58,7 +63,7 @@ def main() -> int:
 
     if github_context_available():
         try:
-            post_pr_comment(report)
+            post_or_update_pr_comment(report)
             print("[info] Comment posted to PR")
         except Exception as exc:
             print(f"[error] GitHub comment failed: {exc}")
